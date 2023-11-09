@@ -1,0 +1,187 @@
+import time
+from datetime import datetime, timedelta, date
+
+import pandas as pd
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from sqlalchemy.dialects import registry
+from Scrapers.bronze_shell_utils.SeleniumSetupTool import SeleniumSetupTool
+from Scrapers.IPO.Base_IPO_Scraper import BaseIpoScraper
+from Scrapers.bronze_shell_utils.SnowflakeTool import SnowflakeTool
+
+
+class EastMoneyFundScraper(BaseIpoScraper):
+    scraper_name = 'EastMoney_Fund_Scraper'
+    target_url = 'http://data.eastmoney.com/notices/hsa/5.html'
+    in_scope_indicator = ['投资设立', '对外投资', '产业基金', '共同设立', '认购', '基金', '私募基金', '投资机构', '有限合伙', '投资基金', '合伙企业',
+                          '设立投资', '合作投资', '共同投资', '创业投资', '参与投资', "并购基金", "参与设立"]
+    oos_indicator = ['合资公司', '工商', '注册登记', '项目', '立全', '立控', '立子', '股票发行']
+    #'立全', '立控', '立子' filters out filing name such as "投资设立子公司", "投资设立全资子公司", "投资设立控股子公司"
+
+    ipo_df = pd.DataFrame(columns=['TICKER', 'LP_FAMILIAR_NAME', 'EVENT_DATE',  'URL', 'PROSPECTUS_TITLE'])
+    selenium_setup_tool = SeleniumSetupTool()
+    def __init__(self, minus_day=0):
+        super(EastMoneyFundScraper, self).__init__()
+        self.scope_end_date = (date.today() + timedelta(days=1)) - timedelta(days=minus_day)
+        self.scope_start_date = self.scope_end_date - timedelta(days=3)  # Always scrape 7 days
+
+    def scrape_eastmoney(self):
+        print(f"Scraping EastMoney Fund {self.scope_start_date} and {self.scope_end_date}...")
+        scope_cleared = False
+        scopes = []
+
+        tbody = ""
+        while tbody == "":
+            try:
+                driver, wait = self.selenium_setup_tool.get_selenium_driver()
+                driver.get(self.target_url)
+
+                wait.until(EC.presence_of_element_located((By.XPATH,
+                                                           '//div[@class="pagerbox"]')))
+                wait.until(EC.visibility_of_element_located((By.XPATH,
+                                                           '//div[@class="pagerbox"]')))
+                time.sleep(5)
+                driver.execute_script('window.stop();')
+
+                # Find the "投资相关" tab and click
+                registration_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[text()='投资相关']")))
+                registration_tab.click()
+
+                # After clicking the tab, wait for the content inside the tab to load
+                wait.until(EC.presence_of_element_located((By.XPATH, '//div[@class="pagerbox"]')))
+                wait.until(EC.visibility_of_element_located((By.XPATH,
+                                                            '//div[@class="pagerbox"]')))
+
+                wait.until(EC.element_to_be_clickable((By.XPATH, "//*[text()='下一页']")))
+
+                wait.until(EC.presence_of_element_located((By.XPATH, '//tbody/tr')))
+
+                driver.execute_script('window.stop();')
+                # Extract data from page
+                page_html = driver.page_source  # Get html source code
+                soup = BeautifulSoup(page_html, 'lxml')
+                tbody = soup.find("tbody")
+            except Exception as e:
+                print("Maybe Proxy connection error. Retrying with a different proxy...")
+                print(e)
+
+        while not scope_cleared:
+            records = tbody.find_all("tr")
+            for record in records:
+                TickerSymbol = record.find_all('td')[0].text #ticker symbol
+                LegalName = record.find_all('td')[1].text # brand name
+                meeting_dates = record.find_all('td')[5].text # deal date
+                pros_urls = record.find_all('td')[3].find("a") # prospectus URL
+                pros_urls = "http://data.eastmoney.com" + pros_urls["href"]
+                pros_names = record.find_all('td')[3].text # prospectus name
+                if any(word in pros_names for word in self.in_scope_indicator) and \
+                        not any(word in pros_names for word in self.oos_indicator):
+                    self.ipo_df.loc[len(self.ipo_df)] = [TickerSymbol, LegalName, meeting_dates,  pros_urls, pros_names]
+            #  Continue to scrape if in scope
+                round_date = datetime.strptime(meeting_dates, '%Y-%m-%d').date()
+                scopes.append(self.scope_start_date <= round_date <= self.scope_end_date)
+            # If scope is cleared, exit loop, if not, keep scraping next page.
+            if False in scopes:
+                print("Scope cleared.")
+                break
+            else:
+                print("Keep scraping next page...")
+                tbody = ""
+                while tbody == "":
+                    try:
+                        wait.until(EC.presence_of_element_located((By.XPATH, '//div[@class="pagerbox"]')))
+                        wait.until(EC.visibility_of_element_located((By.XPATH,
+                                                                     '//div[@class="pagerbox"]')))
+
+                        wait.until(EC.invisibility_of_element((By.CSS_SELECTOR, ".dataview-loading")))
+
+                        next_page_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[text()='下一页']")))
+                        time.sleep(2)
+                        next_page_tab.click()
+                        wait.until(EC.presence_of_element_located(
+                            (By.XPATH, '//tbody//tr')))
+
+
+                        # Extract data from page
+                        page_html = driver.page_source  # Get html source code
+                        soup = BeautifulSoup(page_html, 'lxml')
+                        tbody = soup.find("tbody")
+                    except Exception as e:
+                        print("Maybe Proxy connection error. Retrying with a different proxy...")
+                        print(e)
+        driver.quit()
+        print(f"\nEastmoney Fund scraping finished with {len(self.ipo_df)} records added.")
+
+
+        #Drop Dupe rows
+        self.ipo_df.drop_duplicates(inplace=True)
+
+    def output_excel(self):
+        writer = pd.ExcelWriter(f'EastMoney_Fund_Scraper_{self.scope_start_date}_to_{self.scope_end_date}.xlsx',
+                                engine='xlsxwriter')
+        self.ipo_df.to_excel(writer, 'EastMoney_Fund_Scraper', index=False)
+        writer.save()
+
+    def cross_reference_deal_history(self):
+        print("Checking dupes from 7 day historical deal list...")
+        registry.register('snowflake', 'snowflake.sqlalchemy', 'dialect')
+        # Create Snowflake connection engine
+        engine = SnowflakeTool.get_snowflake_engine()
+        # Get all deals captured from past 7 days
+        check_range = date.today() - timedelta(days=7)
+        query = """
+        SELECT * FROM BSHELL_FUND_EVENTS
+        WHERE EVENT_DATE >= to_date('{}')
+        """.format(check_range)
+        query_result = pd.read_sql(query, con=engine)
+        # Check if deal has been captured in previous days
+        delete_count = 0
+        for index, row in self.ipo_df.iterrows():
+            pros_url = row["URL"]
+            # Delete deal if prospectus url exists in past 7 days deals
+            if pros_url in query_result['url'].tolist():
+                self.ipo_df = self.ipo_df.drop(index)
+                delete_count += 1
+
+                # Print info about matched results
+                url_match_records = query_result['url'].tolist()
+
+                if pros_url in query_result['url'].tolist():
+                    match_index = url_match_records.index(pros_url)
+
+                print("{} has a record on {} with familiar name {}, hence is considered a dupe and deleted.".
+                      format(pros_url, query_result["event_date"][match_index],
+                             query_result['lp_familiar_name'][match_index]))
+
+        self.ipo_df = self.ipo_df.reset_index(drop=True)
+        print("\nConsolidation completed with {} deals deleted. Consolidated list now have {} deals.\n"
+              .format(delete_count, len(list(self.ipo_df['URL']))))
+
+    def send_to_snowflake(self):
+        print(f"Sending {len(self.ipo_df)} new records to snowflake for record keeping...")
+        snowflake_copy_df = self.ipo_df.copy()
+        ##snowflake_copy_df1 = snowflake_copy_df.rename(columns={"LegalName": "LP_FAMILIAR_NAME", "dates": "EVENT_DATE", "pros_url": "URL", "pros_names": "PROSPECTUS_TITLE"})
+        engine = SnowflakeTool.get_snowflake_engine()
+        snowflake_copy_df.to_sql(name="bshell_fund_events", con=engine, if_exists='append', index=False)
+
+def main():
+    load_dotenv()
+    print("-----------------------------------------------------------------------------------------------------------")
+    print("Start Eastmoney Fund scraping workflow:" + '\n')
+
+    eastmoney_scraper = EastMoneyFundScraper()
+    eastmoney_scraper.scrape_eastmoney()
+    eastmoney_scraper.cross_reference_deal_history()
+
+    if len(eastmoney_scraper.ipo_df) == 0:
+        print("\nNo deals today")
+        return
+
+    eastmoney_scraper.send_to_snowflake()
+    eastmoney_scraper.output_excel()
+    print('\nEastmoney Fund scraping workflow finished.\n')
+
+if __name__ == "__main__":
+    main()
